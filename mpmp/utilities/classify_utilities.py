@@ -106,7 +106,7 @@ def run_cv_stratified(data_model,
                     X_test_df, y_test_df, sample_info, data_model.seed)
 
         try:
-            model_results = train_model(
+            cv_pipeline = train_model(
                 X_train=X_train_df,
                 X_test=X_test_df,
                 y_train=y_train_df,
@@ -126,8 +126,6 @@ def run_cv_stratified(data_model,
                 # if not only one class error, just re-raise
                 raise e
 
-        (cv_pipeline, y_cv_df) = model_results
-
         # get coefficients
         coef_df = extract_coefficients(
             cv_pipeline=cv_pipeline,
@@ -145,7 +143,6 @@ def run_cv_stratified(data_model,
                 X_test_df,
                 y_train_df,
                 y_test_df,
-                y_cv_df,
                 cv_pipeline,
                 identifier,
                 training_data,
@@ -248,11 +245,10 @@ def get_prob_metrics(y_true, y_prob):
     }
 
 
-def get_metrics(X_train,
-                X_test,
+def get_metrics(X_train_df,
+                X_test_df,
                 y_train_df,
                 y_test_df,
-                y_cv_df,
                 cv_pipeline,
                 identifier,
                 training_data,
@@ -261,8 +257,16 @@ def get_metrics(X_train,
                 fold_no):
 
     # get decision function scores
-    y_train_scores = cv_pipeline.decision_function(X_train)
-    y_test_scores = cv_pipeline.decision_function(X_test)
+    y_train_scores = cv_pipeline.decision_function(X_train_df)
+    y_test_scores = cv_pipeline.decision_function(X_test_df)
+    # get cross validation scores
+    y_cv_scores = cross_val_predict(
+        cv_pipeline.best_estimator_,
+        X=X_train_df,
+        y=y_train_df.status,
+        cv=cfg.folds,
+        method="decision_function",
+    )
     # get binarized (thresholded) classification metric values
     y_train_results = get_threshold_metrics(
         y_train_df.status, y_train_scores, drop=False
@@ -271,15 +275,23 @@ def get_metrics(X_train,
         y_test_df.status, y_test_scores, drop=False
     )
     y_cv_results = get_threshold_metrics(
-        y_train_df.status, y_cv_df, drop=False
+        y_train_df.status, y_cv_scores, drop=False
     )
 
     # make sure we're actually looking at positive class prob
     assert np.array_equal(cv_pipeline.best_estimator_.classes_,
                           np.array([0, 1]))
     # get probabilities of positive class from best predictor
-    y_train_probs = cv_pipeline.predict_proba(X_train)[:, 1]
-    y_test_probs = cv_pipeline.predict_proba(X_test)[:, 1]
+    y_train_probs = cv_pipeline.predict_proba(X_train_df)[:, 1]
+    y_test_probs = cv_pipeline.predict_proba(X_test_df)[:, 1]
+    # get cross validation probabilities
+    y_cv_probs = cross_val_predict(
+        cv_pipeline.best_estimator_,
+        X=X_train_df,
+        y=y_train_df.status,
+        cv=cfg.folds,
+        method="predict_proba",
+    )[:, 1]
     # get probability-based performance metric values
     y_train_prob_results = get_prob_metrics(
         y_train_df.status, y_train_probs
@@ -287,10 +299,14 @@ def get_metrics(X_train,
     y_test_prob_results = get_prob_metrics(
         y_test_df.status, y_test_probs
     )
+    y_cv_prob_results = get_prob_metrics(
+        y_train_df.status, y_cv_probs
+    )
 
     # merge metric dicts
     y_train_results = {**y_train_results, **y_train_prob_results}
     y_test_results = {**y_test_results, **y_test_prob_results}
+    y_cv_results = {**y_cv_results, **y_cv_prob_results}
 
     # summarize all results in dataframes
     # TODO there needs to be a single point of truth for this stuff
@@ -388,17 +404,7 @@ def train_model(X_train,
 
     # Fit the model
     cv_pipeline.fit(X=X_train, y=y_train.status)
-
-    # Obtain cross validation results
-    y_cv = cross_val_predict(
-        cv_pipeline.best_estimator_,
-        X=X_train,
-        y=y_train.status,
-        cv=n_folds,
-        method="decision_function",
-    )
-
-    return cv_pipeline, y_cv
+    return cv_pipeline
 
 
 def extract_coefficients(cv_pipeline, feature_names, signal, seed):
@@ -462,19 +468,12 @@ def summarize_results(results,
         fold_no,
     ]
 
-    # TODO: good way to differentiate between CV metrics and train/test metrics
-    if data_type == 'cv':
-        metrics_out_ = [
-            results["auroc"],
-            results["aupr"]
-        ] + results_append_list
-    else:
-        metrics_out_ = [
-            results["auroc"],
-            results["aupr"],
-            results["brier_score"],
-            results["weighted_brier_score"]
-        ] + results_append_list
+    metrics_out_ = [
+        results["auroc"],
+        results["aupr"],
+        results["brier_score"],
+        results["weighted_brier_score"]
+    ] + results_append_list
 
     roc_df_ = results["roc_df"]
     pr_df_ = results["pr_df"]
