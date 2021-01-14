@@ -14,13 +14,15 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
     precision_recall_curve,
-    average_precision_score
+    average_precision_score,
+    brier_score_loss,
 )
 from sklearn.model_selection import (
     StratifiedKFold,
     cross_val_predict,
     GridSearchCV,
 )
+from sklearn.utils.class_weight import compute_sample_weight
 
 import mpmp.config as cfg
 import mpmp.utilities.tcga_utilities as tu
@@ -124,10 +126,7 @@ def run_cv_stratified(data_model,
                 # if not only one class error, just re-raise
                 raise e
 
-        (cv_pipeline,
-         y_pred_train,
-         y_pred_test,
-         y_cv_df) = model_results
+        (cv_pipeline, y_cv_df) = model_results
 
         # get coefficients
         coef_df = extract_coefficients(
@@ -142,9 +141,17 @@ def run_cv_stratified(data_model,
 
         try:
             metric_df, auc_df, aupr_df = get_metrics(
-                y_train_df, y_test_df, y_cv_df, y_pred_train,
-                y_pred_test, identifier, training_data, signal,
-                data_model.seed, fold_no
+                X_train_df,
+                X_test_df,
+                y_train_df,
+                y_test_df,
+                y_cv_df,
+                cv_pipeline,
+                identifier,
+                training_data,
+                signal,
+                data_model.seed,
+                fold_no
             )
         except ValueError as e:
             if 'Only one class' in str(e):
@@ -185,14 +192,14 @@ def get_preds(X_test_df, y_test_df, cv_pipeline, fold_no):
     }, index=y_test_df.index)
 
 
-def get_threshold_metrics(y_true, y_pred, drop=False):
+def get_threshold_metrics(y_true, y_scores, drop=False):
     """
     Retrieve true/false positive rates and auroc/aupr for class predictions
 
     Arguments
     ---------
     y_true: an array of gold standard mutation status
-    y_pred: an array of predicted mutation status
+    y_scores: an array of scores, to be thresholded into binary predictions
     drop: boolean if intermediate thresholds are dropped
 
     Returns
@@ -202,39 +209,96 @@ def get_threshold_metrics(y_true, y_pred, drop=False):
     roc_columns = ["fpr", "tpr", "threshold"]
     pr_columns = ["precision", "recall", "threshold"]
 
-    roc_results = roc_curve(y_true, y_pred, drop_intermediate=drop)
+    roc_results = roc_curve(y_true, y_scores, drop_intermediate=drop)
     roc_items = zip(roc_columns, roc_results)
     roc_df = pd.DataFrame.from_dict(dict(roc_items))
 
-    prec, rec, thresh = precision_recall_curve(y_true, y_pred)
+    prec, rec, thresh = precision_recall_curve(y_true, y_scores)
     pr_df = pd.DataFrame.from_records([prec, rec]).T
     pr_df = pd.concat([pr_df, pd.Series(thresh)], ignore_index=True, axis=1)
     pr_df.columns = pr_columns
 
-    auroc = roc_auc_score(y_true, y_pred, average="weighted")
-    aupr = average_precision_score(y_true, y_pred, average="weighted")
+    auroc = roc_auc_score(y_true, y_scores, average="weighted")
+    aupr = average_precision_score(y_true, y_scores, average="weighted")
 
     return {"auroc": auroc, "aupr": aupr, "roc_df": roc_df, "pr_df": pr_df}
 
 
-def get_metrics(y_train_df, y_test_df, y_cv_df, y_pred_train, y_pred_test,
-                identifier, training_data, signal, seed, fold_no):
+def get_prob_metrics(y_true, y_prob):
+    """
+    Retrieve metrics for probability predictions.
 
-    # get classification metric values
+    Currently this is just Brier scoring and weighted Brier scoring
+    (TODO: explain sample weighting).
+
+    Arguments
+    ---------
+    y_true: an array of gold standard mutation status
+    y_prob: an array of probabilities of the positive class (TODO: yes?)
+
+    Returns
+    -------
+    dict of desired metrics
+    """
+    sample_weights = compute_sample_weight('balanced', y_true)
+    return {
+        'brier_score': brier_score_loss(y_true, y_prob),
+        'weighted_brier_score': brier_score_loss(y_true, y_prob,
+                                                 sample_weight=sample_weights)
+    }
+
+
+def get_metrics(X_train,
+                X_test,
+                y_train_df,
+                y_test_df,
+                y_cv_df,
+                cv_pipeline,
+                identifier,
+                training_data,
+                signal,
+                seed,
+                fold_no):
+
+    # get decision function scores
+    y_train_scores = cv_pipeline.decision_function(X_train)
+    y_test_scores = cv_pipeline.decision_function(X_test)
+    # get binarized (thresholded) classification metric values
     y_train_results = get_threshold_metrics(
-        y_train_df.status, y_pred_train, drop=False
+        y_train_df.status, y_train_scores, drop=False
     )
     y_test_results = get_threshold_metrics(
-        y_test_df.status, y_pred_test, drop=False
+        y_test_df.status, y_test_scores, drop=False
     )
     y_cv_results = get_threshold_metrics(
         y_train_df.status, y_cv_df, drop=False
     )
 
+    # make sure we're actually looking at positive class prob
+    assert np.array_equal(cv_pipeline.best_estimator_.classes_,
+                          np.array([0, 1]))
+    # get probabilities of positive class from best predictor
+    y_train_probs = cv_pipeline.predict_proba(X_train)[:, 1]
+    y_test_probs = cv_pipeline.predict_proba(X_test)[:, 1]
+    # get probability-based performance metric values
+    y_train_prob_results = get_prob_metrics(
+        y_train_df.status, y_train_probs
+    )
+    y_test_prob_results = get_prob_metrics(
+        y_test_df.status, y_test_probs
+    )
+
+    # merge metric dicts
+    y_train_results = {**y_train_results, **y_train_prob_results}
+    y_test_results = {**y_test_results, **y_test_prob_results}
+
     # summarize all results in dataframes
+    # TODO there needs to be a single point of truth for this stuff
     metric_cols = [
         "auroc",
         "aupr",
+        "brier_score",
+        "weighted_brier_score",
         "identifier",
         "training_data",
         "signal",
@@ -334,11 +398,7 @@ def train_model(X_train,
         method="decision_function",
     )
 
-    # Get all performance results
-    y_predict_train = cv_pipeline.decision_function(X_train)
-    y_predict_test = cv_pipeline.decision_function(X_test)
-
-    return cv_pipeline, y_predict_train, y_predict_test, y_cv
+    return cv_pipeline, y_cv
 
 
 def extract_coefficients(cv_pipeline, feature_names, signal, seed):
@@ -390,6 +450,9 @@ def summarize_results(results,
     data_type: the type of data (either training, testing, or cv)
     fold_no: the fold number for the external cross-validation loop
     """
+    # TODO there needs to be a single, easily modifiable point of truth
+    # for this column order/metrics and metadata
+    # this code is currently confusing and hard to extend to new metrics
     results_append_list = [
         identifier,
         training_data,
@@ -399,7 +462,19 @@ def summarize_results(results,
         fold_no,
     ]
 
-    metrics_out_ = [results["auroc"], results["aupr"]] + results_append_list
+    # TODO: good way to differentiate between CV metrics and train/test metrics
+    if data_type == 'cv':
+        metrics_out_ = [
+            results["auroc"],
+            results["aupr"]
+        ] + results_append_list
+    else:
+        metrics_out_ = [
+            results["auroc"],
+            results["aupr"],
+            results["brier_score"],
+            results["weighted_brier_score"]
+        ] + results_append_list
 
     roc_df_ = results["roc_df"]
     pr_df_ = results["pr_df"]

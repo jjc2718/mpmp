@@ -144,7 +144,7 @@ def save_results(output_dir,
                                      identifier,
                                      shuffle_labels,
                                      model_options,
-                                     'classify_metrics',
+                                     'performance_metrics',
                                      '.tsv.gz')
     metrics_df.to_csv(
         output_file, sep="\t", index=False, float_format="%.5g"
