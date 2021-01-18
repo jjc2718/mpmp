@@ -28,7 +28,11 @@ def load_stratified_prediction_results(results_dir, experiment_descriptor):
         for results_file in identifier_dir.iterdir():
             if not results_file.is_file(): continue
             results_filename = str(results_file.stem)
-            if 'classify' not in results_filename: continue
+            # changed the name of this, so either classify or
+            # performance is a valid results file
+            if ('classify' not in results_filename and
+                'performance' not in results_filename):
+                continue
             if results_filename[0] == '.': continue
             id_results_df = pd.read_csv(results_file, sep='\t')
             id_results_df['experiment'] = experiment_descriptor
